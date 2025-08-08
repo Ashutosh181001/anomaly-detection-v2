@@ -19,6 +19,7 @@ import config
 from features import compute_features
 from db_writer import DataWriter
 from alerts import AlertManager
+from benchmark_logger import BenchmarkLogger
 
 # Setup logging
 logging.basicConfig(
@@ -44,22 +45,26 @@ class AnomalyDetector:
         self.model = self._load_model()
         self.is_model_fitted = False
 
+        # Initialize benchmarking
+        self.benchmark = BenchmarkLogger(
+            csv_path='performance_log.csv',
+            json_path='benchmark_summary.json',
+            report_interval=100
+        )
+
         # Check if loaded model is already fitted
         if self.model is not None:
             try:
-                # Test if model can make predictions
-                self.model.predict([[0, 0, 0]])
+                _ = self.model.predict([[0, 0, 0]])
                 self.is_model_fitted = True
                 logger.info("✅ Model is fitted and ready for predictions")
             except:
                 self.is_model_fitted = False
                 logger.info("⏳ Model needs training - will train after collecting sufficient data")
 
-        # Initialize buffers
+        # Initialize buffers and counters
         self.history_df = pd.DataFrame(columns=['timestamp', 'price', 'quantity', 'is_buyer_maker'])
         self.buffer_for_training = []
-
-        # Counters
         self.trade_counter = 0
         self.anomaly_counter = 0
         self.last_status_time = time.time()
@@ -71,16 +76,14 @@ class AnomalyDetector:
         self.consumer = self._init_kafka_consumer()
 
     def _load_model(self):
-        """Load pre-trained model or initialize new one"""
-        # Try loading tuned model first
+        """Load or initialize the anomaly detection model"""
+        # Try tuned model
         if os.path.exists(config.MODEL_PATHS["tuned_model"]):
             try:
                 model = joblib.load(config.MODEL_PATHS["tuned_model"])
                 logger.info("✅ Loaded tuned Isolation Forest model")
-                # Check if model is fitted
                 try:
-                    # Test prediction with dummy data
-                    model.predict([[0, 0, 0]])
+                    _ = model.predict([[0, 0, 0]])
                     return model
                 except:
                     logger.warning("Tuned model not fitted, will retrain")
@@ -93,10 +96,8 @@ class AnomalyDetector:
             try:
                 model = joblib.load(config.MODEL_PATHS["base_model"])
                 logger.info("✅ Loaded base Isolation Forest model")
-                # Check if model is fitted
                 try:
-                    # Test prediction with dummy data
-                    model.predict([[0, 0, 0]])
+                    _ = model.predict([[0, 0, 0]])
                     return model
                 except:
                     logger.warning("Base model not fitted, will retrain")
@@ -116,14 +117,11 @@ class AnomalyDetector:
         """Load historical trades for warm start"""
         try:
             recent_trades = self.data_writer.get_recent_trades(minutes=60)
-
             if not recent_trades.empty:
-                # Take last N trades for history
-                window_size = config.DATA_CONFIG["rolling_window"]
+                window = config.DATA_CONFIG["rolling_window"]
                 self.history_df = recent_trades[
                     ['timestamp', 'price', 'quantity', 'is_buyer_maker']
-                ].tail(window_size).copy()
-
+                ].tail(window).copy()
                 logger.info(f"📊 Loaded {len(self.history_df)} historical trades for warm start")
         except Exception as e:
             logger.error(f"Failed to load historical data: {e}")
@@ -147,85 +145,59 @@ class AnomalyDetector:
     def detect_anomalies(self, features: dict) -> list:
         """
         Detect anomalies using z-score and Isolation Forest
-
         Returns list of detected anomaly types
         """
         detected = []
-
         # Z-score detection
         if abs(features.get('z_score', 0)) > config.ANOMALY_CONFIG["z_score_threshold"]:
             detected.append("z_score")
-
-        # Isolation Forest detection - only if model is fitted and we have enough buffer
+        # Isolation Forest detection
         if self.is_model_fitted and len(self.buffer_for_training) >= config.DATA_CONFIG["min_history"]:
             try:
-                # Prepare features for model
-                model_features = [
+                model_feats = [
                     features.get('z_score', 0),
                     features.get('price_change_pct', 0),
                     features.get('time_gap_sec', 0)
                 ]
-
-                # Predict
-                prediction = self.model.predict([model_features])[0]
-
-                if prediction == -1:  # Anomaly
-                    if "z_score" in detected:
-                        detected.append("filtered_isoforest")
-                    else:
-                        detected.append("isoforest")
-
+                pred = self.model.predict([model_feats])[0]
+                if pred == -1:
+                    tag = "filtered_isoforest" if "z_score" in detected else "isoforest"
+                    detected.append(tag)
             except Exception as e:
                 logger.error(f"Model prediction failed: {e}")
-
         return detected
 
     def update_model(self):
         """Retrain model with recent data"""
-        min_samples = 100  # Minimum samples needed to train
-
+        min_samples = 100
         if len(self.buffer_for_training) < min_samples:
-            logger.debug(f"Not enough data for training: {len(self.buffer_for_training)}/{min_samples}")
             return
-
         try:
-            # Get recent training data
-            recent_data = np.array(
+            data = np.array(
                 self.buffer_for_training[-config.DATA_CONFIG["rolling_window"]:]
                 if len(self.buffer_for_training) > config.DATA_CONFIG["rolling_window"]
                 else self.buffer_for_training
             )
-
-            # Fit model
-            self.model.fit(recent_data)
+            self.model.fit(data)
             self.is_model_fitted = True
-
-            # Save model
             joblib.dump(self.model, config.MODEL_PATHS["base_model"])
-            logger.info(f"🔄 Model trained with {len(recent_data)} samples and saved")
-
+            logger.info(f"🔄 Model trained with {len(data)} samples and saved")
         except Exception as e:
             logger.error(f"Model retraining failed: {e}")
 
     def print_status(self):
         """Print periodic status update"""
-        current_time = time.time()
-
-        if current_time - self.last_status_time >= 30:  # Every 30 seconds
-            anomaly_rate = (
-                self.anomaly_counter / self.trade_counter * 100
-                if self.trade_counter > 0 else 0
-            )
-
+        now = time.time()
+        if now - self.last_status_time >= 30:
+            rate = (self.anomaly_counter / self.trade_counter * 100) if self.trade_counter else 0
             logger.info(f"""
             📊 STATUS UPDATE
             ├─ Trades processed: {self.trade_counter:,}
             ├─ Anomalies detected: {self.anomaly_counter:,}
-            ├─ Detection rate: {anomaly_rate:.2f}%
+            ├─ Detection rate: {rate:.2f}%
             └─ Model fitted: {self.is_model_fitted}
             """)
-
-            self.last_status_time = current_time
+            self.last_status_time = now
 
     def run(self):
         """Main detection loop"""
@@ -235,6 +207,9 @@ class AnomalyDetector:
         for message in self.consumer:
             try:
                 trade = message.value
+
+                # --- Benchmark: processing timer start ---
+                proc_start = time.perf_counter()
 
                 # Compute features
                 features, self.history_df = compute_features(
@@ -246,6 +221,14 @@ class AnomalyDetector:
                 # Log trade
                 trade_id = self.data_writer.log_trade(features)
                 self.trade_counter += 1
+
+                # --- Benchmark: processing timer end & log ---
+                proc_end = time.perf_counter()
+                self.benchmark.log_event(
+                    'trade',
+                    trade_id,
+                    duration=proc_end - proc_start
+                )
 
                 # Print trade info
                 if self.trade_counter % config.PIPELINE_CONFIG["status_interval"] == 0:
@@ -267,13 +250,21 @@ class AnomalyDetector:
                     features.get('time_gap_sec', 0)
                 ])
 
-                # Detect anomalies
+                # --- Benchmark: detection timer start ---
+                det_start = time.perf_counter()
                 anomalies = self.detect_anomalies(features)
+                det_end = time.perf_counter()
+                self.benchmark.log_event(
+                    'detection',
+                    trade_id,
+                    duration=det_end - det_start
+                )
 
                 # Process detected anomalies
                 if anomalies:
                     self.anomaly_counter += len(anomalies)
-
+                    # Benchmark: anomaly event
+                    self.benchmark.log_event('anomaly', trade_id)
                     for anomaly_type in anomalies:
                         # Log anomaly
                         self.data_writer.log_anomaly(features, anomaly_type, trade_id)
@@ -281,21 +272,22 @@ class AnomalyDetector:
                         # Send alert
                         self.alert_manager.send_alert(features, anomaly_type)
 
+                        # Benchmark: alert sent
+                        self.benchmark.log_event('alert', trade_id)
+
                         logger.warning(f"🚨 {anomaly_type.upper()} anomaly detected!")
 
-                # Retrain model periodically or when we have enough initial data
+                # Retrain model periodically
                 if not self.is_model_fitted and len(self.buffer_for_training) >= 100:
-                    # Initial training when we have enough data
                     logger.info("📊 Sufficient data collected for initial model training")
                     self.update_model()
                 elif self.trade_counter % config.PIPELINE_CONFIG["retrain_interval"] == 0:
-                    # Periodic retraining
                     self.update_model()
 
                 # Print status
                 self.print_status()
 
-                # Optional sleep for debugging
+                # Optional sleep
                 if config.PIPELINE_CONFIG["sleep_between_trades"]:
                     time.sleep(config.PIPELINE_CONFIG["sleep_duration"])
 
@@ -324,7 +316,6 @@ class AnomalyDetector:
 
 if __name__ == "__main__":
     detector = AnomalyDetector()
-
     try:
         detector.run()
     except KeyboardInterrupt:
