@@ -1,6 +1,6 @@
 """
 Database Writer Module
-Handles data persistence to SQLite or CSV
+Handles data persistence to SQLite or CSV with multi-symbol support
 """
 
 import sqlite3
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class DataWriter:
-    """Handles data persistence with SQLite preference and CSV fallback"""
+    """Handles data persistence with SQLite preference and CSV fallback - Multi-symbol support"""
 
     def __init__(self):
         self.use_db = config.STORAGE_CONFIG["use_database"]
@@ -29,13 +29,14 @@ class DataWriter:
             self._init_database()
 
     def _init_database(self):
-        """Initialize SQLite database with tables"""
+        """Initialize SQLite database with tables including symbol column"""
         try:
             with self.get_connection() as conn:
-                # Trades table
+                # Trades table with symbol column
                 conn.execute('''
                     CREATE TABLE IF NOT EXISTS trades (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT NOT NULL,
                         timestamp DATETIME NOT NULL,
                         price REAL NOT NULL,
                         quantity REAL NOT NULL,
@@ -60,11 +61,12 @@ class DataWriter:
                     )
                 ''')
 
-                # Anomalies table
+                # Anomalies table with symbol column
                 conn.execute('''
                     CREATE TABLE IF NOT EXISTS anomalies (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         trade_id INTEGER,
+                        symbol TEXT NOT NULL,
                         timestamp DATETIME NOT NULL,
                         anomaly_type TEXT NOT NULL,
                         price REAL,
@@ -77,13 +79,17 @@ class DataWriter:
                     )
                 ''')
 
-                # Create indexes
+                # Create indexes including symbol
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_trades_symbol_timestamp ON trades(symbol, timestamp)')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_anomalies_symbol ON anomalies(symbol)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_anomalies_timestamp ON anomalies(timestamp)')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_anomalies_symbol_timestamp ON anomalies(symbol, timestamp)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_anomalies_type ON anomalies(anomaly_type)')
 
                 conn.commit()
-                logger.info("Database initialized successfully")
+                logger.info("Database initialized successfully with multi-symbol support")
 
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
@@ -101,10 +107,13 @@ class DataWriter:
 
     def log_trade(self, features: Dict) -> Optional[int]:
         """
-        Log trade to database or CSV
+        Log trade to database or CSV with symbol support
 
         Returns trade_id if using database, None otherwise
         """
+        # Extract symbol (required field)
+        symbol = features.get('symbol', 'BTC/USDT')  # Default to BTC/USDT if missing
+
         if self.use_db:
             try:
                 with self.get_connection() as conn:
@@ -112,15 +121,16 @@ class DataWriter:
 
                     cursor.execute('''
                         INSERT INTO trades (
-                            timestamp, price, quantity, is_buyer_maker,
+                            symbol, timestamp, price, quantity, is_buyer_maker,
                             z_score, rolling_mean, rolling_std,
                             price_change_pct, time_gap_sec, volume_ratio,
                             buy_pressure, vwap, vwap_deviation,
                             price_velocity, volume_spike,
                             hour, day_of_week, trading_session, is_weekend,
                             injected
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
+                        symbol,
                         features['timestamp'],
                         features['price'],
                         features['quantity'],
@@ -150,9 +160,12 @@ class DataWriter:
                 logger.error(f"Database trade insertion failed: {e}")
                 self.use_db = False  # Fallback to CSV
 
-        # CSV fallback
+        # CSV fallback - ensure symbol is included
         try:
-            pd.DataFrame([features]).to_csv(
+            features_copy = features.copy()
+            features_copy['symbol'] = symbol  # Ensure symbol is in CSV
+
+            pd.DataFrame([features_copy]).to_csv(
                 self.trades_csv,
                 mode='a',
                 header=not os.path.exists(self.trades_csv),
@@ -164,10 +177,14 @@ class DataWriter:
         return None
 
     def log_anomaly(self, features: Dict, method: str, trade_id: Optional[int] = None):
-        """Log anomaly to database or CSV"""
+        """Log anomaly to database or CSV with symbol support"""
+
+        # Extract symbol
+        symbol = features.get('symbol', 'BTC/USDT')
 
         # Prepare anomaly record
         anomaly_record = {
+            'symbol': symbol,
             'timestamp': features['timestamp'],
             'anomaly_type': method + ("_injected" if features.get('injected') else ""),
             'price': features['price'],
@@ -184,12 +201,13 @@ class DataWriter:
 
                     cursor.execute('''
                         INSERT INTO anomalies (
-                            trade_id, timestamp, anomaly_type,
+                            trade_id, symbol, timestamp, anomaly_type,
                             price, z_score, price_change_pct,
                             volume_spike, vwap_deviation
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         trade_id,
+                        symbol,
                         anomaly_record['timestamp'],
                         anomaly_record['anomaly_type'],
                         anomaly_record['price'],
@@ -217,18 +235,27 @@ class DataWriter:
         except Exception as e:
             logger.error(f"CSV anomaly logging failed: {e}")
 
-    def get_recent_trades(self, minutes: int = 60) -> pd.DataFrame:
-        """Get recent trades from storage"""
+    def get_recent_trades(self, minutes: int = 60, symbol: Optional[str] = None) -> pd.DataFrame:
+        """Get recent trades from storage, optionally filtered by symbol"""
         if self.use_db:
             try:
                 with self.get_connection() as conn:
-                    query = '''
-                        SELECT * FROM trades
-                        WHERE datetime(timestamp) >= datetime('now', '-{} minutes')
-                        ORDER BY timestamp DESC
-                    '''.format(minutes)
+                    if symbol:
+                        query = '''
+                            SELECT * FROM trades
+                            WHERE symbol = ? 
+                            AND datetime(timestamp) >= datetime('now', '-{} minutes')
+                            ORDER BY timestamp DESC
+                        '''.format(minutes)
+                        return pd.read_sql_query(query, conn, params=[symbol])
+                    else:
+                        query = '''
+                            SELECT * FROM trades
+                            WHERE datetime(timestamp) >= datetime('now', '-{} minutes')
+                            ORDER BY timestamp DESC
+                        '''.format(minutes)
+                        return pd.read_sql_query(query, conn)
 
-                    return pd.read_sql_query(query, conn)
             except Exception as e:
                 logger.error(f"Failed to read from database: {e}")
 
@@ -238,24 +265,39 @@ class DataWriter:
                 df = pd.read_csv(self.trades_csv)
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
                 cutoff = pd.Timestamp.now() - pd.Timedelta(minutes=minutes)
-                return df[df['timestamp'] >= cutoff].sort_values('timestamp', ascending=False)
+                df = df[df['timestamp'] >= cutoff]
+
+                # Filter by symbol if specified
+                if symbol and 'symbol' in df.columns:
+                    df = df[df['symbol'] == symbol]
+
+                return df.sort_values('timestamp', ascending=False)
             except Exception as e:
                 logger.error(f"Failed to read from CSV: {e}")
 
         return pd.DataFrame()
 
-    def get_recent_anomalies(self, minutes: int = 60) -> pd.DataFrame:
-        """Get recent anomalies from storage"""
+    def get_recent_anomalies(self, minutes: int = 60, symbol: Optional[str] = None) -> pd.DataFrame:
+        """Get recent anomalies from storage, optionally filtered by symbol"""
         if self.use_db:
             try:
                 with self.get_connection() as conn:
-                    query = '''
-                        SELECT * FROM anomalies
-                        WHERE datetime(timestamp) >= datetime('now', '-{} minutes')
-                        ORDER BY timestamp DESC
-                    '''.format(minutes)
+                    if symbol:
+                        query = '''
+                            SELECT * FROM anomalies
+                            WHERE symbol = ?
+                            AND datetime(timestamp) >= datetime('now', '-{} minutes')
+                            ORDER BY timestamp DESC
+                        '''.format(minutes)
+                        return pd.read_sql_query(query, conn, params=[symbol])
+                    else:
+                        query = '''
+                            SELECT * FROM anomalies
+                            WHERE datetime(timestamp) >= datetime('now', '-{} minutes')
+                            ORDER BY timestamp DESC
+                        '''.format(minutes)
+                        return pd.read_sql_query(query, conn)
 
-                    return pd.read_sql_query(query, conn)
             except Exception as e:
                 logger.error(f"Failed to read anomalies from database: {e}")
 
@@ -265,8 +307,42 @@ class DataWriter:
                 df = pd.read_csv(self.anomalies_csv)
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
                 cutoff = pd.Timestamp.now() - pd.Timedelta(minutes=minutes)
-                return df[df['timestamp'] >= cutoff].sort_values('timestamp', ascending=False)
+                df = df[df['timestamp'] >= cutoff]
+
+                # Filter by symbol if specified
+                if symbol and 'symbol' in df.columns:
+                    df = df[df['symbol'] == symbol]
+
+                return df.sort_values('timestamp', ascending=False)
             except Exception as e:
                 logger.error(f"Failed to read anomalies from CSV: {e}")
 
         return pd.DataFrame()
+
+    def get_symbols(self) -> list:
+        """Get list of unique symbols in the database"""
+        symbols = []
+
+        if self.use_db:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT DISTINCT symbol FROM trades ORDER BY symbol")
+                    symbols = [row[0] for row in cursor.fetchall()]
+                    if symbols:
+                        return symbols
+            except Exception as e:
+                logger.error(f"Failed to get symbols from database: {e}")
+
+        # CSV fallback
+        if os.path.exists(self.trades_csv):
+            try:
+                df = pd.read_csv(self.trades_csv, nrows=1000)  # Sample for performance
+                if 'symbol' in df.columns:
+                    symbols = df['symbol'].unique().tolist()
+                    return sorted(symbols)
+            except Exception as e:
+                logger.error(f"Failed to get symbols from CSV: {e}")
+
+        # Return default symbols if no data
+        return ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"]

@@ -1,6 +1,7 @@
 """
 BTC/USDT Anomaly Detection Dashboard
 Streamlit dashboard with time tabs and visualization
+Modified to support multiple symbols with minimal changes
 """
 
 import os
@@ -34,9 +35,9 @@ TIME_INTERVALS = {
 }
 
 
-def load_trades(minutes: int) -> pd.DataFrame:
-    """Load trades within the specified time window"""
-    logger.info(f"Loading trades for last {minutes} minutes")
+def load_trades(minutes: int, symbol: str = "BTC/USDT") -> pd.DataFrame:
+    """Load trades within the specified time window for a specific symbol"""
+    logger.info(f"Loading trades for last {minutes} minutes for {symbol}")
 
     # Try database first if configured
     if USE_DATABASE and os.path.exists(DATABASE_PATH):
@@ -44,21 +45,65 @@ def load_trades(minutes: int) -> pd.DataFrame:
         try:
             conn = sqlite3.connect(DATABASE_PATH)
 
-            # Query for recent trades
-            query = """
-                SELECT timestamp, price, quantity, z_score, rolling_mean, rolling_std,
-                       price_change_pct, volume_spike, is_buyer_maker
-                FROM trades
-                WHERE datetime(timestamp) >= datetime('now', '-{} minutes')
-                ORDER BY timestamp ASC
-            """.format(minutes)
+            # Check if symbol column exists
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(trades)")
+            columns = [column[1] for column in cursor.fetchall()]
+            has_symbol_column = 'symbol' in columns
 
-            df = pd.read_sql_query(query, conn)
+            # Calculate cutoff time in milliseconds
+            current_time_ms = int(datetime.utcnow().timestamp() * 1000)
+            cutoff_time_ms = current_time_ms - (minutes * 60 * 1000)
+
+            logger.info(f"Current time (ms): {current_time_ms}")
+            logger.info(f"Cutoff time (ms): {cutoff_time_ms}")
+            logger.info(f"Time window: {minutes} minutes")
+
+            if has_symbol_column:
+                # First check what we have in database
+                test_query = """
+                    SELECT MIN(CAST(timestamp AS INTEGER)) as min_ts, 
+                           MAX(CAST(timestamp AS INTEGER)) as max_ts,
+                           COUNT(*) as total
+                    FROM trades 
+                    WHERE symbol = ?
+                """
+                test_result = pd.read_sql_query(test_query, conn, params=[symbol])
+                if not test_result.empty:
+                    logger.info(
+                        f"DB stats - Min timestamp: {test_result['min_ts'][0]}, Max timestamp: {test_result['max_ts'][0]}, Total: {test_result['total'][0]}")
+
+                query = """
+                    SELECT timestamp, price, quantity, z_score, rolling_mean, rolling_std,
+                           price_change_pct, volume_spike, is_buyer_maker
+                    FROM trades
+                    WHERE symbol = ?
+                    AND CAST(timestamp AS INTEGER) >= ?
+                    ORDER BY timestamp ASC
+                """
+                df = pd.read_sql_query(query, conn, params=[symbol, cutoff_time_ms])
+            else:
+                # Old database without symbol column
+                query = """
+                    SELECT timestamp, price, quantity, z_score, rolling_mean, rolling_std,
+                           price_change_pct, volume_spike, is_buyer_maker
+                    FROM trades
+                    WHERE CAST(timestamp AS INTEGER) >= ?
+                    ORDER BY timestamp ASC
+                """
+                df = pd.read_sql_query(query, conn, params=[cutoff_time_ms])
+
             conn.close()
 
             if not df.empty:
-                df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
-                logger.info(f"Loaded {len(df)} trades from database")
+                # Convert timestamp from milliseconds to datetime
+                df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
+
+                # Additional filtering after conversion to ensure we have the right time window
+                cutoff_datetime = datetime.utcnow() - timedelta(minutes=minutes)
+                df = df[df['timestamp'] >= cutoff_datetime]
+
+                logger.info(f"Loaded {len(df)} trades from database after filtering")
 
                 # Log sample of data for debugging
                 if len(df) > 0:
@@ -71,6 +116,8 @@ def load_trades(minutes: int) -> pd.DataFrame:
 
         except Exception as e:
             logger.error(f"Error loading from database: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     # Fall back to CSV
     if os.path.exists(TRADE_LOG):
@@ -85,6 +132,11 @@ def load_trades(minutes: int) -> pd.DataFrame:
 
             logger.info(f"CSV has {len(df)} total rows")
 
+            # Filter by symbol if column exists
+            if 'symbol' in df.columns:
+                df = df[df['symbol'] == symbol]
+                logger.info(f"Filtered to {len(df)} rows for {symbol}")
+
             df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
 
             # Filter by time window
@@ -95,14 +147,6 @@ def load_trades(minutes: int) -> pd.DataFrame:
 
             if df.empty:
                 logger.warning(f"No trades found after filtering (all trades older than {cutoff})")
-                # Log the latest trades in file for debugging
-                original_df = pd.read_csv(TRADE_LOG)
-                if not original_df.empty:
-                    original_df['timestamp'] = pd.to_datetime(original_df['timestamp'])
-                    latest = original_df.nlargest(5, 'timestamp')
-                    logger.info(f"Latest 5 trades in file:")
-                    for _, row in latest.iterrows():
-                        logger.info(f"  {row['timestamp']} @ ${row['price']:.2f}")
             else:
                 logger.info(f"Found {len(df)} trades in time window")
 
@@ -123,9 +167,9 @@ def load_trades(minutes: int) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def load_anomalies(minutes: int, anomaly_types: list = None) -> pd.DataFrame:
-    """Load anomalies within the specified time window"""
-    logger.info(f"Loading anomalies for last {minutes} minutes")
+def load_anomalies(minutes: int, symbol: str = "BTC/USDT", anomaly_types: list = None) -> pd.DataFrame:
+    """Load anomalies within the specified time window for a specific symbol"""
+    logger.info(f"Loading anomalies for last {minutes} minutes for {symbol}")
 
     # Try database first if configured
     if USE_DATABASE and os.path.exists(DATABASE_PATH):
@@ -133,25 +177,50 @@ def load_anomalies(minutes: int, anomaly_types: list = None) -> pd.DataFrame:
         try:
             conn = sqlite3.connect(DATABASE_PATH)
 
-            # Query for recent anomalies
-            query = """
-                SELECT timestamp, anomaly_type, price, z_score, price_change_pct, volume_spike
-                FROM anomalies
-                WHERE datetime(timestamp) >= datetime('now', '-{} minutes')
-                ORDER BY timestamp DESC
-            """.format(minutes)
+            # Check if symbol column exists
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(anomalies)")
+            columns = [column[1] for column in cursor.fetchall()]
+            has_symbol_column = 'symbol' in columns
 
-            df = pd.read_sql_query(query, conn)
+            # Calculate cutoff time in milliseconds
+            current_time_ms = int(datetime.utcnow().timestamp() * 1000)
+            cutoff_time_ms = current_time_ms - (minutes * 60 * 1000)
+
+            if has_symbol_column:
+                query = """
+                    SELECT timestamp, anomaly_type, price, z_score, price_change_pct, volume_spike
+                    FROM anomalies
+                    WHERE symbol = ?
+                    AND CAST(timestamp AS INTEGER) >= ?
+                    ORDER BY timestamp DESC
+                """
+                df = pd.read_sql_query(query, conn, params=[symbol, cutoff_time_ms])
+            else:
+                # Old database without symbol column
+                query = """
+                    SELECT timestamp, anomaly_type, price, z_score, price_change_pct, volume_spike
+                    FROM anomalies
+                    WHERE CAST(timestamp AS INTEGER) >= ?
+                    ORDER BY timestamp DESC
+                """
+                df = pd.read_sql_query(query, conn, params=[cutoff_time_ms])
+
             conn.close()
 
             if not df.empty:
-                df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
+                # Convert timestamp from milliseconds to datetime
+                df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
+
+                # Additional filtering after conversion
+                cutoff_datetime = datetime.utcnow() - timedelta(minutes=minutes)
+                df = df[df['timestamp'] >= cutoff_datetime]
 
                 # Filter by type if specified
                 if anomaly_types:
                     df = df[df['anomaly_type'].isin(anomaly_types)]
 
-                logger.info(f"Loaded {len(df)} anomalies from database")
+                logger.info(f"Loaded {len(df)} anomalies from database after filtering")
                 return df
             else:
                 logger.info("No anomalies found in database")
@@ -168,6 +237,10 @@ def load_anomalies(minutes: int, anomaly_types: list = None) -> pd.DataFrame:
             if df.empty:
                 logger.warning("Anomaly CSV is empty")
                 return pd.DataFrame()
+
+            # Filter by symbol if column exists
+            if 'symbol' in df.columns:
+                df = df[df['symbol'] == symbol]
 
             df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
 
@@ -221,7 +294,7 @@ def aggregate_to_candlesticks(trades_df: pd.DataFrame, interval: str) -> pd.Data
         return pd.DataFrame()
 
 
-def create_metrics_row(trades_df: pd.DataFrame, anomalies_df: pd.DataFrame, interval_name: str):
+def create_metrics_row(trades_df: pd.DataFrame, anomalies_df: pd.DataFrame, interval_name: str, symbol: str = "BTC/USDT"):
     """Display key metrics"""
     if trades_df.empty:
         st.warning("No trade data available")
@@ -244,10 +317,12 @@ def create_metrics_row(trades_df: pd.DataFrame, anomalies_df: pd.DataFrame, inte
     with col3:
         st.metric(f"{interval_name} Low", f"${trades_df['price'].min():,.2f}")
 
-    # Volume
+    # Volume - extract base currency from symbol
     total_volume = trades_df['quantity'].sum() if 'quantity' in trades_df.columns else 0
+    base_currency = symbol.split('/')[0] if '/' in symbol else 'BTC'
+
     with col4:
-        st.metric("Volume", f"{total_volume:.4f} BTC")
+        st.metric("Volume", f"{total_volume:.4f} {base_currency}")
 
     # Anomalies
     with col5:
@@ -452,7 +527,7 @@ def create_zscore_chart(trades_df: pd.DataFrame) -> go.Figure:
 
 
 def display_interval(interval_name: str, interval_config: dict,
-                    show_ma: bool, selected_anomaly_types: list, chart_type: str):
+                    show_ma: bool, selected_anomaly_types: list, chart_type: str, selected_symbol: str):
     """Display content for a single time interval"""
     minutes = interval_config["minutes"]
 
@@ -461,19 +536,19 @@ def display_interval(interval_name: str, interval_config: dict,
         @st.fragment(run_every=interval_config["refresh"])
         def render_interval():
             _render_interval_content(interval_name, minutes, interval_config,
-                                    show_ma, selected_anomaly_types, chart_type)
+                                    show_ma, selected_anomaly_types, chart_type, selected_symbol)
         render_interval()
     else:
         _render_interval_content(interval_name, minutes, interval_config,
-                                show_ma, selected_anomaly_types, chart_type)
+                                show_ma, selected_anomaly_types, chart_type, selected_symbol)
 
 
 def _render_interval_content(interval_name: str, minutes: int, interval_config: dict,
-                            show_ma: bool, selected_anomaly_types: list, chart_type: str):
+                            show_ma: bool, selected_anomaly_types: list, chart_type: str, selected_symbol: str):
     """Render the actual interval content"""
     # Load data
-    trades_df = load_trades(minutes)
-    anomalies_df = load_anomalies(minutes, selected_anomaly_types)
+    trades_df = load_trades(minutes, selected_symbol)
+    anomalies_df = load_anomalies(minutes, selected_symbol, selected_anomaly_types)
 
     if trades_df.empty:
         st.warning(f"No trade data available for {interval_name}")
@@ -481,6 +556,7 @@ def _render_interval_content(interval_name: str, minutes: int, interval_config: 
         # Show debugging information
         with st.expander("🔍 Debug Information"):
             st.write("**Configuration:**")
+            st.write(f"- Selected Symbol: {selected_symbol}")
             st.write(f"- Using Database: {USE_DATABASE}")
             st.write(f"- Database Path: {DATABASE_PATH} (exists: {os.path.exists(DATABASE_PATH)})")
             st.write(f"- CSV Path: {TRADE_LOG} (exists: {os.path.exists(TRADE_LOG)})")
@@ -505,13 +581,29 @@ def _render_interval_content(interval_name: str, minutes: int, interval_config: 
             if USE_DATABASE and os.path.exists(DATABASE_PATH):
                 try:
                     conn = sqlite3.connect(DATABASE_PATH)
-                    count_query = "SELECT COUNT(*) as count FROM trades"
-                    result = pd.read_sql_query(count_query, conn)
-                    st.write(f"**Total trades in database:** {result['count'][0]}")
 
-                    # Get latest trade
-                    latest_query = "SELECT * FROM trades ORDER BY timestamp DESC LIMIT 1"
-                    latest = pd.read_sql_query(latest_query, conn)
+                    # Check if symbol column exists
+                    cursor = conn.cursor()
+                    cursor.execute("PRAGMA table_info(trades)")
+                    columns = [column[1] for column in cursor.fetchall()]
+
+                    if 'symbol' in columns:
+                        count_query = "SELECT COUNT(*) as count FROM trades WHERE symbol = ?"
+                        result = pd.read_sql_query(count_query, conn, params=[selected_symbol])
+                        st.write(f"**Total {selected_symbol} trades in database:** {result['count'][0]}")
+
+                        # Get latest trade
+                        latest_query = "SELECT * FROM trades WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1"
+                        latest = pd.read_sql_query(latest_query, conn, params=[selected_symbol])
+                    else:
+                        count_query = "SELECT COUNT(*) as count FROM trades"
+                        result = pd.read_sql_query(count_query, conn)
+                        st.write(f"**Total trades in database:** {result['count'][0]}")
+
+                        # Get latest trade
+                        latest_query = "SELECT * FROM trades ORDER BY timestamp DESC LIMIT 1"
+                        latest = pd.read_sql_query(latest_query, conn)
+
                     if not latest.empty:
                         st.write(f"**Latest trade in database:**")
                         st.write(f"- Timestamp: {latest['timestamp'][0]}")
@@ -522,7 +614,7 @@ def _render_interval_content(interval_name: str, minutes: int, interval_config: 
         return
 
     # Metrics row
-    create_metrics_row(trades_df, anomalies_df, interval_name)
+    create_metrics_row(trades_df, anomalies_df, interval_name, selected_symbol)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -540,12 +632,14 @@ def _render_interval_content(interval_name: str, minutes: int, interval_config: 
         # Line chart only for longer timeframes
         fig = create_line_chart(trades_df, anomalies_df, show_ma)
 
-    st.plotly_chart(fig, use_container_width=True)
+    # Add unique key to prevent duplicate element ID error
+    st.plotly_chart(fig, use_container_width=True, key=f"main_chart_{interval_name}_{selected_symbol}")
 
     # Z-score chart
     st.subheader("📊 Z-Score Analysis")
     z_fig = create_zscore_chart(trades_df)
-    st.plotly_chart(z_fig, use_container_width=True)
+    # Add unique key to prevent duplicate element ID error
+    st.plotly_chart(z_fig, use_container_width=True, key=f"zscore_chart_{interval_name}_{selected_symbol}")
 
     # Recent anomalies table
     if not anomalies_df.empty:
@@ -568,7 +662,7 @@ def _render_interval_content(interval_name: str, minutes: int, interval_config: 
 def main():
     """Main dashboard function"""
     st.set_page_config(
-        page_title="BTC/USDT Anomaly Detection",
+        page_title="Crypto Anomaly Detection",
         layout="wide",
         page_icon="📊"
     )
@@ -596,18 +690,30 @@ def main():
         </style>
     """, unsafe_allow_html=True)
 
-    st.title("📊 BTC/USDT Anomaly Detection Dashboard")
+    st.title("📊 Crypto Anomaly Detection Dashboard")
+
+    # Add symbol selector
+    available_symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"]
+    selected_symbol = st.selectbox(
+        "Select Cryptocurrency",
+        available_symbols,
+        index=0,
+        key="symbol_selector"
+    )
 
     # Quick data availability check
-    data_status = check_data_availability()
+    data_status = check_data_availability(selected_symbol)
     if data_status:
         st.success(data_status)
     else:
-        st.error("⚠️ No data sources available. Please ensure the detector is running.")
+        st.error(f"⚠️ No data sources available for {selected_symbol}. Please ensure the detector is running.")
 
     # Sidebar settings
     with st.sidebar:
         st.header("⚙️ Settings")
+
+        # Show selected symbol
+        st.info(f"Currently viewing: **{selected_symbol}**")
 
         st.subheader("Indicators")
         show_ma = st.checkbox("Show Moving Average", value=True)
@@ -622,7 +728,7 @@ def main():
         st.subheader("Anomaly Filters")
 
         # Get all anomaly types
-        all_anomalies = load_anomalies(10080)  # Last week
+        all_anomalies = load_anomalies(10080, selected_symbol)  # Last week
         if not all_anomalies.empty and 'anomaly_type' in all_anomalies.columns:
             anomaly_types = sorted(all_anomalies['anomaly_type'].unique())
             selected_types = st.multiselect(
@@ -632,8 +738,6 @@ def main():
             )
         else:
             selected_types = []
-
-
 
         # Data source info
         st.subheader("📁 Data Source")
@@ -654,21 +758,30 @@ def main():
 
     for i, (interval_name, interval_config) in enumerate(TIME_INTERVALS.items()):
         with tabs[i]:
-            display_interval(interval_name, interval_config, show_ma, selected_types, chart_type)
+            display_interval(interval_name, interval_config, show_ma, selected_types, chart_type, selected_symbol)
 
 
-def check_data_availability():
+def check_data_availability(symbol: str = "BTC/USDT"):
     """Check if data is available and return status message"""
     if USE_DATABASE and os.path.exists(DATABASE_PATH):
         try:
             conn = sqlite3.connect(DATABASE_PATH)
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM trades")
+
+            # Check if symbol column exists
+            cursor.execute("PRAGMA table_info(trades)")
+            columns = [column[1] for column in cursor.fetchall()]
+
+            if 'symbol' in columns:
+                cursor.execute("SELECT COUNT(*) FROM trades WHERE symbol = ?", [symbol])
+            else:
+                cursor.execute("SELECT COUNT(*) FROM trades")
+
             count = cursor.fetchone()[0]
             conn.close()
 
             if count > 0:
-                return f"✅ Database connected"
+                return f"✅ Database connected: {count:,} trades"
         except:
             pass
 

@@ -1,16 +1,22 @@
 """
-Centralized configuration for Real-Time Anomaly Detection Pipeline
+Centralized configuration for Multi-Symbol Real-Time Anomaly Detection Pipeline
 Master's Dissertation: "Real-Time Anomaly Detection in Crypto Streaming Data"
+Supports: BTC/USDT, ETH/USDT, BNB/USDT, SOL/USDT, XRP/USDT
 """
 
 import os
 from typing import Dict, Any
 
 # ===========================
+# SUPPORTED SYMBOLS
+# ===========================
+SUPPORTED_SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"]
+
+# ===========================
 # KAFKA CONFIGURATION
 # ===========================
 KAFKA_CONFIG = {
-    "topic": "crypto_trades",
+    "topic": "crypto_trades",  # Single topic for all symbols
     "broker": "localhost:9092",
     "consumer_group": "anomaly_detector",
     "auto_offset_reset": "latest",
@@ -20,8 +26,8 @@ KAFKA_CONFIG = {
 # DATA CONFIGURATION
 # ===========================
 DATA_CONFIG = {
-    "asset_pair": "BTC/USDT",
-    "rolling_window": 1000,  # Number of trades for rolling statistics
+    "symbols": SUPPORTED_SYMBOLS,  # List of supported symbols
+    "rolling_window": 1000,  # Number of trades for rolling statistics (per symbol)
     "min_history": 50,  # Minimum trades needed for meaningful statistics
 }
 
@@ -33,6 +39,7 @@ ANOMALY_CONFIG = {
     "contamination": 0.01,  # Expected anomaly rate for Isolation Forest
     "n_estimators": 100,  # Number of trees in Isolation Forest
     "random_state": 42,
+    "cooldown_seconds": 60,  # Cooldown period between anomaly alerts per symbol
 }
 
 # ===========================
@@ -41,6 +48,7 @@ ANOMALY_CONFIG = {
 MODEL_PATHS = {
     "base_model": "model_isoforest.pkl",
     "tuned_model": "model_isoforest_best.pkl",
+    # Per-symbol models will be saved as: model_isoforest_BTC_USDT.pkl, etc.
 }
 
 # ===========================
@@ -71,6 +79,15 @@ ALERT_CONFIG = {
     "alert_on_zscore": True,
     "alert_on_isoforest": False,  # Only alert on filtered (z-score + isoforest)
     "alert_on_filtered": True,
+
+    # Per-symbol alert settings (optional future enhancement)
+    "symbol_specific_thresholds": {
+        "BTC/USDT": {"z_score_threshold": 3.5},
+        "ETH/USDT": {"z_score_threshold": 3.5},
+        "BNB/USDT": {"z_score_threshold": 4.0},  # Less volatile
+        "SOL/USDT": {"z_score_threshold": 3.0},  # More volatile
+        "XRP/USDT": {"z_score_threshold": 3.5},
+    }
 }
 
 # ===========================
@@ -87,8 +104,8 @@ FEATURE_CONFIG = {
 # PIPELINE CONFIGURATION
 # ===========================
 PIPELINE_CONFIG = {
-    "retrain_interval": 1000,  # Retrain model every N trades
-    "status_interval": 100,  # Print status every N trades
+    "retrain_interval": 1000,  # Retrain model every N trades (per symbol)
+    "status_interval": 100,  # Print status every N trades (per symbol)
     "sleep_between_trades": False,  # Add delay for debugging
     "sleep_duration": 0.1,  # Seconds to sleep if enabled
 }
@@ -98,8 +115,9 @@ PIPELINE_CONFIG = {
 # ===========================
 DASHBOARD_CONFIG = {
     "refresh_interval": 5,  # Seconds between dashboard refreshes
-    "max_display_trades": 1000,  # Maximum trades to display
+    "max_display_trades": 1000,  # Maximum trades to display per symbol
     "chart_height": 600,  # Pixel height for charts
+    "default_symbol": "BTC/USDT",  # Default symbol to display
 }
 
 # ===========================
@@ -107,7 +125,7 @@ DASHBOARD_CONFIG = {
 # ===========================
 EVALUATION_CONFIG = {
     "enable_synthetic_injection": False,  # Enable for dissertation evaluation
-    "synthetic_anomaly_rate": 0.05,  # 5% injection rate
+    "synthetic_anomaly_rate": 0.05,  # 5% injection rate (applies to all symbols)
     "evaluation_window_hours": 24,
     "minimum_samples": 100,
 }
@@ -139,7 +157,20 @@ def get_config() -> Dict[str, Any]:
         "dashboard": DASHBOARD_CONFIG,
         "evaluation": EVALUATION_CONFIG,
         "logging": LOGGING_CONFIG,
+        "symbols": SUPPORTED_SYMBOLS,
     }
+
+
+def get_symbol_config(symbol: str) -> Dict[str, Any]:
+    """Get configuration specific to a symbol"""
+    config = get_config()
+
+    # Add any symbol-specific overrides
+    if symbol in ALERT_CONFIG.get("symbol_specific_thresholds", {}):
+        symbol_thresholds = ALERT_CONFIG["symbol_specific_thresholds"][symbol]
+        config["anomaly"].update(symbol_thresholds)
+
+    return config
 
 
 def validate_config() -> bool:
@@ -162,6 +193,14 @@ def validate_config() -> bool:
     if not (0 < ANOMALY_CONFIG["contamination"] < 1):
         issues.append("Contamination must be between 0 and 1")
 
+    # Check cooldown
+    if ANOMALY_CONFIG["cooldown_seconds"] < 0:
+        issues.append("Cooldown period must be non-negative")
+
+    # Check symbols
+    if not SUPPORTED_SYMBOLS:
+        issues.append("No symbols configured")
+
     # Print validation results
     if issues:
         print("⚠️ Configuration issues detected:")
@@ -170,6 +209,8 @@ def validate_config() -> bool:
         return False
 
     print("✅ Configuration validated successfully")
+    print(f"📊 Configured for {len(SUPPORTED_SYMBOLS)} symbols: {', '.join(SUPPORTED_SYMBOLS)}")
+    print(f"⏱️ Anomaly cooldown: {ANOMALY_CONFIG['cooldown_seconds']} seconds")
     return True
 
 
